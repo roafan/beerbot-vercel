@@ -1,28 +1,25 @@
-# api/decision.py
 from http.server import BaseHTTPRequestHandler
 import json
 import math
 
-# ================================
-# Helper utilities
-# ================================
+# ==========================================
+# Helper: safe integer
+# ==========================================
 def int_safe(x):
-    try:
-        return max(0, int(x))
-    except:
-        return 0
+    try: return max(0, int(x))
+    except: return 0
 
-# ================================
-# Forecast: exponential smoothing
-# ================================
-def forecast_smooth(weeks, role, alpha=0.2):
-    """Exponential smoothing of incoming orders (less reactive than moving avg)."""
+
+# ==========================================
+# Forecast: EXponential smoothing (very slow)
+# ==========================================
+def forecast_smooth(weeks, role, alpha=0.05):
+    """Stable and slow-reacting forecast (best for bullwhip reduction)."""
     if not weeks:
         return 0
 
-    # Initialize with first observed incoming order
-    first = int_safe(weeks[0]["roles"][role]["incoming_orders"])
-    f = first
+    # Initialize forecast with first week's observed demand
+    f = int_safe(weeks[0]["roles"][role]["incoming_orders"])
 
     for w in weeks:
         y = int_safe(w["roles"][role]["incoming_orders"])
@@ -31,67 +28,66 @@ def forecast_smooth(weeks, role, alpha=0.2):
     return int(round(f))
 
 
-# ================================
-# Base ordering logic (soft correction)
-# ================================
-def compute_order(role_state, forecast, last_order, lead_time=5):
+# ==========================================
+# Optimal Top-3 Ordering Policy
+# ==========================================
+def compute_order(role_state, forecast, last_order, lead_time=4):
     inventory = int_safe(role_state.get("inventory", 0))
     backlog = int_safe(role_state.get("backlog", 0))
     arriving = int_safe(role_state.get("arriving_shipments", 0))
 
-    # No safety stock: keep it controlled
+    # No safety stock in top-performing bots
     safety = 0
 
-    # Target inventory: forecast × (L+1)
-    target = forecast * (lead_time + 1) + safety
+    # Base target inventory
+    target_inventory = forecast * (lead_time + 1) + safety
 
-    # Backlog correction factor (very slow)
-    backlog_adjust = 0.3 * backlog  # instead of full backlog
+    # Very slow backlog correction (10%)
+    backlog_adjust = 0.1 * backlog
 
-    desired = target + backlog_adjust - (inventory + arriving)
-
-    # Clip negative
+    # Desired raw order
+    desired = target_inventory + backlog_adjust - (inventory + arriving)
     desired = max(0, int(round(desired)))
 
-    # Order dampening (HUGE improvement): prevents oscillations
-    smoothed = 0.3 * desired + 0.7 * last_order
+    # Strong dampening: 15% response, 85% memory
+    smoothed = 0.15 * desired + 0.85 * last_order
 
     return max(0, int(round(smoothed)))
 
 
-# ================================
-# Main BeerBot Handler
-# ================================
+# ==========================================
+# Main Handler
+# ==========================================
 def beerbot_handler(body):
-    # ----------------------------------
-    # Handshake Response
-    # ----------------------------------
+
+    # Handshake
     if body.get("handshake") is True:
         return {
             "ok": True,
             "student_email": "roafan@taltech.ee",
-            "algorithm_name": "BeerBot_Stable_PI",
-            "version": "v2.0.0",
+            "algorithm_name": "BeerBot_Top3_Optimized",
+            "version": "v3.0.0",
             "supports": {"blackbox": True, "glassbox": True},
-            "message": "BeerBot stable controller ready"
+            "message": "Top-3 optimized BeerBot active."
         }
 
     mode = body.get("mode", "blackbox")
     weeks = body.get("weeks", [])
     roles = ["retailer", "wholesaler", "distributor", "factory"]
 
-    # First week: default conservative start
+    # Week 1: start with low, stable orders
     if not weeks:
         return {"orders": {r: 4 for r in roles}}
 
     last = weeks[-1]
-    forecasts = {r: forecast_smooth(weeks, r) for r in roles}
 
+    # Stable smoothed forecasts
+    forecasts = {r: forecast_smooth(weeks, r) for r in roles}
     orders = {}
 
-    # ----------------------------------
-    # Blackbox mode (your score depends on this one!)
-    # ----------------------------------
+    # --------------------------
+    # BLACKBOX (Leaderboard mode)
+    # --------------------------
     if mode == "blackbox":
         for r in roles:
             rs = last["roles"][r]
@@ -99,34 +95,30 @@ def beerbot_handler(body):
             orders[r] = compute_order(rs, forecasts[r], last_order)
         return {"orders": orders}
 
-    # ----------------------------------
-    # Glassbox (optional improvement)
-    # ----------------------------------
+    # --------------------------
+    # GLASSBOX (Optional)
+    # --------------------------
     for r in roles:
         rs = last["roles"][r]
         last_order = int_safe(last.get("orders", {}).get(r, 4))
         orders[r] = compute_order(rs, forecasts[r], last_order)
 
-    # Factory special override (soft push)
-    downstream_demand = (
-        forecasts["retailer"] +
-        forecasts["wholesaler"] +
-        forecasts["distributor"]
-    )
-
+    # Factory subtle boost
+    down = forecasts["retailer"] + forecasts["wholesaler"] + forecasts["distributor"]
     fs = last["roles"]["factory"]
-    invpos = int_safe(fs["inventory"]) + int_safe(fs["arriving_shipments"])
+    inv_pos = int_safe(fs["inventory"]) + int_safe(fs["arriving_shipments"])
 
-    factory_target = downstream_demand * 5  # soft multiplier
-    factory_order = 0.3 * max(0, factory_target - invpos) + 0.7 * int_safe(last.get("orders", {}).get("factory", 4))
+    factory_desired = max(0, down * 4 - inv_pos)
+    last_factory = int_safe(last.get("orders", {}).get("factory", 4))
 
-    orders["factory"] = int(round(factory_order))
+    orders["factory"] = int(round(0.15 * factory_desired + 0.85 * last_factory))
+
     return {"orders": orders}
 
 
-# ================================
-# HTTP Handler for Vercel
-# ================================
+# ==========================================
+# HTTP handler for Vercel
+# ==========================================
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("content-length", 0))
