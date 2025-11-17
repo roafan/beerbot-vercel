@@ -77,7 +77,7 @@ def beerbot_handler(body):
             "algorithm_name": "BeerBot_Optimized",
             "version": "v4.0.0",
             "supports": {"blackbox": True, "glassbox": True},
-            "message": "Rank #1 optimized BeerBot ready."
+            "message": "Optimized BeerBot ready."
         }
 
     mode = body.get("mode", "blackbox")
