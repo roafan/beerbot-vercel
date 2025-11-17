@@ -12,16 +12,17 @@ def int_safe(x):
     except:
         return 0
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def clamp(x, a, b):
+    return max(a, min(b, x))
 
 # -------------------------
-# Forecast: exponential smoothing (role-specific default)
+# Forecast: ultra-slow exponential smoothing
 # -------------------------
-def forecast_smooth_role(weeks, role, alpha=0.08):
-    """Role-aware exponential smoothing. For retailer alpha default = 0.08."""
+def forecast_smooth(weeks, role, alpha=0.03):
+    """Very stable forecast using exponential smoothing (deterministic)."""
     if not weeks:
         return 0
+    # initialize with first observed incoming_orders
     f = int_safe(weeks[0]["roles"][role]["incoming_orders"])
     for w in weeks:
         y = int_safe(w["roles"][role]["incoming_orders"])
@@ -29,112 +30,66 @@ def forecast_smooth_role(weeks, role, alpha=0.08):
     return int(round(f))
 
 # -------------------------
-# Retailer PI controller (stateless computation from weeks history)
+# Estimate lead time (conservative)
 # -------------------------
-def compute_order_retailer(role_state, weeks, last_order):
+def estimate_lead_time(weeks, role):
     """
-    PI-like rule computed deterministically from weeks history:
-      - forecast (exp smoothing)
-      - lead_time estimate (retailer shorter)
-      - proportional term on inventory position gap
-      - integral term computed as sum of recent demand - forecast errors
-      - dampening and step clipping to avoid bullwhip
+    Conservative heuristic for lead time:
+    - default 4.0 weeks (works well for standard MIT game)
+    - minor role-specific adjustments (retailer shorter)
+    Deterministic and simple.
     """
-    # tuning params (chosen to produce Rank1-like rhythm)
-    alpha_forecast = 0.08      # forecast smoothing
-    lead_time = 2.0            # retailer faces short upstream lead
-    Kp = 0.65                  # proportional gain
-    Ki = 0.10                  # integral gain (slow)
-    reaction = 0.20            # how much of desired we respond with immediately
-    max_step = 4               # max change per week (clipping)
+    base = 4.0
+    if role == "retailer":
+        return 2.0  # retailer typically faces shortest upstream lead time
+    return base
 
-    # current state
-    inv = int_safe(role_state.get("inventory", 0))
+# -------------------------
+# Local (role-only) order computation
+# -------------------------
+def compute_local_order(role_state, forecast, last_order,
+                        lead_time=4.0,
+                        backlog_coef=0.07,
+                        reaction=0.12,
+                        max_step=5):
+    """
+    role_state: dict with inventory, backlog, arriving_shipments
+    forecast: int (smoothed demand)
+    last_order: int (previous order for this role)
+    Returns integer order >= 0
+    """
+
+    inventory = int_safe(role_state.get("inventory", 0))
     backlog = int_safe(role_state.get("backlog", 0))
     arriving = int_safe(role_state.get("arriving_shipments", 0))
 
-    # forecast (smoothed)
-    forecast = forecast_smooth_role(weeks, "retailer", alpha=alpha_forecast)
+    # No explicit safety stock (top-performing policy)
+    safety = 0
 
-    # target inventory position (coverage for lead_time + 1)
-    target_pos = forecast * (lead_time + 1)
+    # Target inventory (coverage for lead_time + 1)
+    target_inventory = forecast * (lead_time + 1) + safety
 
-    # proportional error: how far inventory position is from target
-    inv_pos = inv + arriving
-    error_p = target_pos - inv_pos
+    # Small backlog correction (allow some backlog to reduce inventory cost)
+    backlog_adjust = backlog_coef * backlog
 
-    # integral term estimation: sum of recent (observed demand - forecast)
-    # compute over last up to 6 weeks to capture systematic bias
-    integral_horizon = min(6, len(weeks))
-    integral = 0.0
-    for w in weeks[-integral_horizon:]:
-        obs = int_safe(w["roles"]["retailer"]["incoming_orders"])
-        # use the same smoothing process to get forecast up to that week
-        # but simpler: subtract current forecast contribution (proxy)
-        integral += (obs - forecast)
-    # scale integral to moderate impact
-    integral_term = Ki * integral
+    # Raw desired order to move inventory position toward target + small backlog correction
+    desired = target_inventory + backlog_adjust - (inventory + arriving)
+    desired = max(0, int(round(desired)))
 
-    # small backlog correction: eat only a fraction of backlog (backlog is cheaper)
-    backlog_adj = 0.08 * backlog
+    # Dampening: mostly remember last order (very stable)
+    smoothed = reaction * desired + (1 - reaction) * last_order
+    smoothed = int(round(smoothed))
 
-    # desired raw order (base = forecast) + PI corrections
-    desired_raw = forecast + Kp * error_p + backlog_adj + integral_term
-    desired_raw = max(0, desired_raw)
-
-    # reaction smoothing (mix desired and last order)
-    desired = reaction * desired_raw + (1 - reaction) * last_order
-    desired = int(round(desired))
-
-    # step clipping to avoid big swings
-    delta = desired - last_order
+    # Prevent extreme week-to-week changes: clip change to +/- max_step
+    delta = smoothed - last_order
     delta = clamp(delta, -max_step, max_step)
     order = last_order + delta
 
-    # final integer >= 0, and a small floor (avoid starving)
-    order = max(0, int(order))
-    if order == 0:
-        # do not fully drop to zero as that provokes others to overreact; use minimal order 1
-        order = 1
-    return order
+    # Final safety: integer >= 0
+    return max(0, int(order))
 
 # -------------------------
-# Default local controller for other roles
-# (conservative, safe)
-# -------------------------
-def compute_order_local(role, role_state, weeks, last_order):
-    # fallback tuning for non-retailer roles: conservative stable policy
-    # small alpha for smoothing
-    forecast = forecast_smooth_role(weeks, role, alpha=0.05)
-    # conservative lead times
-    lead_time_map = {"retailer": 2.0, "wholesaler": 4.0, "distributor": 4.0, "factory": 4.5}
-    lt = lead_time_map.get(role, 4.0)
-
-    # base target inventory
-    inv = int_safe(role_state.get("inventory", 0))
-    arriving = int_safe(role_state.get("arriving_shipments", 0))
-    backlog = int_safe(role_state.get("backlog", 0))
-
-    target_pos = forecast * (lt + 1)
-    backlog_adj = 0.07 * backlog
-    desired_raw = target_pos + backlog_adj - (inv + arriving)
-    desired_raw = max(0, desired_raw)
-
-    # smoothing and clipping
-    reaction = 0.15
-    max_step = 5
-    desired = reaction * desired_raw + (1 - reaction) * last_order
-    desired = int(round(desired))
-    delta = desired - last_order
-    delta = clamp(delta, -max_step, max_step)
-    order = last_order + delta
-    order = max(0, int(order))
-    if order == 0:
-        order = 1
-    return order
-
-# -------------------------
-# Main handler
+# Main BeerBot handler
 # -------------------------
 def beerbot_handler(body):
     # handshake
@@ -142,8 +97,8 @@ def beerbot_handler(body):
         return {
             "ok": True,
             "student_email": "roafan@taltech.ee",
-            "algorithm_name": "BeerBot_Tuned",
-            "version": "v6.0.0",
+            "algorithm_name": "BeerBot_BlackBox_Robust",
+            "version": "v5.0.0",
             "supports": {"blackbox": True, "glassbox": True},
             "message": "BeerBot ready"
         }
@@ -152,27 +107,40 @@ def beerbot_handler(body):
     weeks = body.get("weeks", [])
     roles = ["retailer", "wholesaler", "distributor", "factory"]
 
-    # initial fallback orders
+    # default conservative starter orders when no history
     if not weeks:
         return {"orders": {r: 4 for r in roles}}
 
     last = weeks[-1]
     orders = {}
 
-    # compute per-role orders; retailer gets special controller
-    for r in roles:
-        rs = last["roles"].get(r, {})
-        last_order = int_safe(last.get("orders", {}).get(r, 4))
-        if r == "retailer":
-            orders[r] = compute_order_retailer(rs, weeks, last_order)
-        else:
-            orders[r] = compute_order_local(r, rs, weeks, last_order)
+    # compute forecasts per role
+    forecasts = {r: forecast_smooth(weeks, r) for r in roles}
 
-    # return orders for all roles; BlackBox will use the role it assigned to you
+    # compute local role orders independently (safe for BlackBox)
+    for r in roles:
+        role_state = last["roles"].get(r, {})
+        # determine last order safely
+        last_order = int_safe(last.get("orders", {}).get(r, 4))
+        # estimate lead time conservatively
+        lt = estimate_lead_time(weeks, r)
+        # compute order with conservative tuning
+        orders[r] = compute_local_order(
+            role_state=role_state,
+            forecast=forecasts[r],
+            last_order=last_order,
+            lead_time=lt,
+            backlog_coef=0.07,   # 7% backlog correction
+            reaction=0.12,       # 12% response to desired
+            max_step=5           # at most +/-5 units change/week
+        )
+
+    # For GlassBox mode, keep same local logic (no cross-role aggressive coordination)
+    # Return deterministic orders for all roles — simulator will use the relevant one in BlackBox.
     return {"orders": orders}
 
 # -------------------------
-# Flask endpoint
+# Flask endpoint for Vercel
 # -------------------------
 @app.post("/api/decision")
 def decision():
