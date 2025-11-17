@@ -42,7 +42,7 @@ def beerbot_handler(body):
     if body.get("handshake") is True:
         return {
             "ok": True,
-            "student_email": "firstname.lastname@taltech.ee",
+            "student_email": "roafan@taltech.ee",
             "algorithm_name": "BeerBot_PI_Controller",
             "version": "v1.0.0",
             "supports": {"blackbox": True, "glassbox": True},
@@ -96,3 +96,4 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         self.wfile.write(response_json.encode("utf-8"))
+
